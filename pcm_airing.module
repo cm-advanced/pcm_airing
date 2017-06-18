@@ -1,0 +1,1395 @@
+<?php
+define ("PCM_AIRING_BI_MONTHLY_TID", 764);
+define ("PCM_AIRING_MONTHLY_TID", 765);
+define ("PCM_AIRING_WEEKLY_TID", 763);
+define ("PCM_AIRING_SERIES_AIRING_TYPE_TID", 820);
+define ("PCM_AIRING_TIMEZONE_SHIFT", TRUE);
+define ("PCM_AIRING_PROJECT_SHOWS_DROPDOWN_VALUES", "dropdown_values");
+define ("PCM_AIRING_PROJECT_SHOWS_WITHOUT_FILES", "without_files");
+define ("PCM_AIRING_PROJECT_SHOWS_VIEW", "pcm_project_shows");
+define ("PCM_AIRING_SHOW_AIRINGS_VIEW", 'pcm_show_airings');
+define ("PCM_AIRING_SHOW_AIRING_GROUP", 'airings_airing_group');
+
+/**
+ * Implements hook_form_alter().
+ */
+function pcm_airing_form_alter(&$form, &$form_state, $form_id) {
+  if (isset($form['#entity']) && $form['#entity_type'] == 'airing') {
+    unset($form['field_airing_title']);
+    $airing_id = isset($form['#entity']->airing_id) ? 
+      $form['#entity']->airing_id : NULL;
+
+    if (!$airing_id) {
+      $query_args= 
+	$_SESSION[CM_PROJECT_PICKET_QUERY_ARGUMENT_SESSION_VARIABLE]; 
+      //get project id
+      $project_id = filter_input(INPUT_GET, 'gid');
+      $project = $project_id ? node_load($project_id) : NULL;
+
+      //get channel from grid
+      $channel = taxonomy_get_term_by_name("Channel ".$query_args['channel']);
+      $channel = $channel ? array_pop($channel) : NULL;
+      
+      //get start time from grid
+      $start = PCM_AIRING_TIMEZONE_SHIFT ? $query_args['timestamp'] - 
+	date('Z',$query_args['timestamp']) : $query_args['timestamp'];
+
+      
+      //look for runtime on project
+      if ($project) {
+	$runtime_tid = 
+	  (isset($project->field_runtime_default[LANGUAGE_NONE]) &&
+	   isset($project->field_runtime_default[LANGUAGE_NONE][0])) ?
+	  $project->field_runtime_default[LANGUAGE_NONE][0]['tid']: NULL;
+	
+	if ($runtime_tid) {
+	  $runtime = pcm_airing_get_runtime_seconds_for_tid($runtime_tid);
+	}
+      }
+      if (!isset($runtime)) {
+	$runtime = 28*60 + 30;
+      }
+
+      $form['field_airing_channel'][LANGUAGE_NONE]['#default_value'][0] = 
+	$channel->tid;
+      
+      $form['field_airing_date'][LANGUAGE_NONE][0]['#default_value']['value'] =
+	date('Y-m-d H:i:s', $start);
+      
+      $form['field_airing_date'][LANGUAGE_NONE][0]['#default_value']['value2'] 
+	= date('Y-m-d H:i:s', $start+$runtime);
+    }
+    else {
+      $project_id = $form['#entity']->field_airing_project_ref[LANGUAGE_NONE];
+      $project_id = $project_id[0]['target_id'];
+      $project = node_load($project_id);
+    }
+
+    //get shows with filenames for project
+    $view = views_get_view(PCM_AIRING_PROJECT_SHOWS_VIEW);
+    if (!$view) {
+      drupal_set_message("Error Code 28989: Missing view:".
+			 PCM_AIRING_PROJECT_SHOWS_VIEW, 'error');
+      return;
+    }
+
+    ////////////////////////////////////////////////////////////////////////
+    //CUSTOM SHOW FIELD LOGIC
+
+    //HIDE THE DEFAULT SHOW FIELD AS BELOW LOGIC WILL REPLACE IT
+    $form['field_airing_show_ref']['#type'] = "hidden";
+
+    $view->set_arguments(array($project_id));
+    $view->execute_display(PCM_AIRING_PROJECT_SHOWS_DROPDOWN_VALUES);
+    $results = $view->result;
+    //$values = array( 0 =>'- None -');
+    $values = array();
+    $has_shows = FALSE;
+    foreach($results as $show) {
+      $has_shows = TRUE;
+      $values[$show->nid] = $show->node_title;
+    }
+
+    //THE CURRENTLY SET SHOW NID OF THE AIRING
+    $existing_show_id =  
+      (isset($form['#entity']->field_airing_show_ref[LANGUAGE_NONE]) &&
+       isset($form['#entity']->field_airing_show_ref[LANGUAGE_NONE][0])) ?
+      $form['#entity']->field_airing_show_ref[LANGUAGE_NONE][0]['target_id']
+      : NULL;
+
+    //MAKE SURE THE EXISTING SHOW IS PART OF THE DROPDOWN
+    if ($existing_show_id && !isset($values[$existing_show_id])) {
+      $has_shows = TRUE;
+      $existing_show = $existing_show_id ? node_load($existing_show_id) : NULL;
+      $values[$existing_show_id] = $existing_show ? $existing_show->title : "";
+    }
+    
+    //SET EXISTING SHOW ID SO WE HAVE IT FOR LATER, IT WILL AT LEAST BE 
+    //NEEDED FOR SWAPPING OUT THE OTHER AIRINGS THAT SHARE THE OLD SHOW FOR
+    //POSSIBLE GROUP EDIT
+    if($existing_show_id) {
+      $form['pcm_existing_show_id'] = array('#type'=>'value',
+					    '#value'=>$existing_show_id);
+    }
+
+    //FIND OUT THE OTHER AIRINGS OF THE SHOW
+    $other_airings = $existing_show_id ? 
+      cm_airing_grid_get_future_show_airings($existing_show_id, $airing_id) :
+      array();
+
+    $edit_type = filter_input(INPUT_GET, 'edit_type');
+
+    //IF THERE ARE OTHER AIRINGS, CHECK FOR QUERY ATTRIBUTE STORING THE USERS
+    //CHOICE FOR EDIT SINGLE AIRING, EDIT ALL FUTURE AIRINGS OF THE SAME SHOW
+    if ($other_airings && !$edit_type) {
+      $show = node_load($existing_show_id);
+
+      $form['pcm_cm_show_edit_type_markup'] = 
+	array(
+	      '#markup'=>l($show->title, "node/".$show->nid)."<br/><br/>".
+	      t("This show also has other Airings. To change this show ".
+		"click the link below and determine how those other " .
+		"Airings are affected.")."<br/><br/>".
+	      l(t("Change Show"),'cm_airing_grid/show_swapout_form',
+		array('query'=> array(
+				      'airing_id' => $airing_id,
+				      'show_nid' => $show->nid,
+				      'source' => 'edit-form',
+				      )
+		      )
+		),
+	      '#prefix' => '<div id="pcm_cm_show_wrapper" class="cm-box">'.
+              "<h2>".t('Show')."</h2>",
+              '#suffix' => '</div>',
+              );
+      
+    }
+    //IF WE HAVE SHOWS, ADD THE DROPDOWN FORM ELEMENT   
+    else if ($has_shows) {
+      $form['pcm_cm_show'] =
+        array(
+              '#type' => 'select',
+              '#options'=> $values,
+              '#default_value' => $existing_show_id,
+              '#prefix' => '<div id="pcm_cm_show_wrapper" class="cm-box">'.
+              "<h2>".t('Show')."</h2>",
+              '#suffix' => '</div>',
+              );
+
+      if ($other_airings) {
+	//IF THIS SHOW HAS OTHER AIRINGS, SET ITS EDIT TYPE
+	$form['pcm_cm_show_edit_type'] = array('#type'=>'value',
+					       '#value'=>$edit_type);
+      }
+
+    }
+    else {
+      //get shows with filenames for project
+      $view = views_get_view(PCM_AIRING_PROJECT_SHOWS_VIEW);
+      if (!$view) {
+	drupal_set_message("Error Code 28989: Missing view:".
+			   PCM_AIRING_PROJECT_SHOWS_VIEW, 'error');
+	return;
+      }
+
+      $view->set_arguments(array($project_id));
+      $view->execute_display(PCM_AIRING_PROJECT_SHOWS_WITHOUT_FILES);
+      $results = $view->result;
+      foreach($results as $show) {
+	$msg = isset($msg) ? $msg : "The project: ". 
+	  l($project->title,"/node/$project_id").
+	  " has no shows with a file name for uploaded content.<br/><br/>".
+	  "Here are the shows for the project with missing file names: <ul>";
+	$msg .= "<li>". l($show->node_title, "node/".$show->nid);
+      }
+      if (isset($msg)) {
+	$msg .= "</ul>";
+      }
+      else {
+	$msg = "Sorry, ".l($project->title,"/node/$project_id").
+	  " does not have any shows associated with it.<br/>";
+      }
+      $msg = "<h2>Sorry, under current configuration, you can only schedule ".
+	"an airing for a project if it has a valid show.</h2> ".$msg.
+	"<br/> You can try with another project or ".
+	l("add a valid show", "node/add/cm-show", 
+	  array('query'=>array('og_group_ref'=>$project_id)))." to it. ";
+
+      drupal_set_message($msg, 'warning');
+      drupal_goto('/admin/project-picker/airing');
+    }
+  }
+}
+
+function pcm_airing_get_single_field_value($entity, $field_name, 
+						  $index = 'value') {
+  if (isset($entity->{$field_name})) {
+    $field = $entity->{$field_name};
+    if (isset($field[LANGUAGE_NONE]) && isset($field[LANGUAGE_NONE][0])) {
+      return $field[LANGUAGE_NONE][0][$index];
+    }
+  }
+  return NULL;
+}
+function pcm_airing_get_next_air_date($start, $frequency) {
+  switch($frequency) {
+  case PCM_AIRING_BI_MONTHLY_TID:
+    $next = pcm_airing_add_to_date($start, 'week', 2);
+    break;
+  case PCM_AIRING_MONTHLY_TID:
+    $next = pcm_airing_add_to_date($start, 'week', 4);
+    break;
+  case PCM_AIRING_WEEKLY_TID:
+    $next = pcm_airing_add_to_date($start, 'week', 1);
+    break;
+  default:
+    //this shouldn't happen, setting to one year so no extra airings will 
+    //happen
+    $next = pcm_airing_add_to_date($start, 'week', 52);
+    break;
+  }
+  return $next;
+}
+
+/**
+ * If this airing is the first of the series we will create all of the 
+ * future airings for this time slot until the end of the season 
+ */
+function pcm_airing_entity_insert($entity, $type) {
+  if ($type == 'airing') {
+    global $pcm_airing_proj_season;
+
+    //fetch airing type
+    $airing_type =
+      pcm_airing_get_single_field_value($entity, 'field_airing_type', 'tid');
+
+    //fetch series request
+    $series_request_nid = 
+      pcm_airing_get_single_field_value($entity, 'field_series_request', 
+					'target_id');
+    $series_request = $series_request_nid ? node_load($series_request_nid) :
+      NULL;
+
+    //fetch series frequency
+    $frequency = 
+      pcm_airing_get_single_field_value($series_request, 
+					'field_series_frequency',
+					'tid');
+
+    //fetch start and end 
+    $start = 
+      pcm_airing_get_single_field_value($entity, 'field_airing_date',
+					'value');
+    $end = 
+      pcm_airing_get_single_field_value($entity, 'field_airing_date',
+					'value2');
+    $runtime = strtotime($end) - strtotime($start);
+
+    //see if this airing is the first of a season run 
+    $first_of_season = isset($entity->first_of_season) ? 
+      $entity->first_of_season : NULL;
+
+    //if  we are first of season and in season mode, create a season's worth
+    //of airings
+    if ($first_of_season &&
+	$airing_type == PCM_AIRING_SERIES_AIRING_TYPE_TID &&
+	$frequency) {
+      $season = timespan_current('pcmseason', 
+				 date('Y-m-d', strtotime($start)));
+      $season_end = strtotime($season['end']);
+    
+      $next_start = 
+	pcm_airing_get_next_air_date(strtotime($start), $frequency);
+      
+      $slot = 1;
+      //setting this so down the line we can link up subsequent airings in
+      //the same slots
+      $entity->slot = $slot;
+
+      $pcm_airing_proj_season = isset($pcm_airing_proj_season) ?
+	$pcm_airing_proj_season : array();
+
+      $pcm_airing_proj_season[$slot] = isset($pcm_airing_proj_season[$slot]) ?
+	$pcm_airing_proj_season[$slot] : array();
+
+      $pcm_airing_proj_season[$slot][] = $entity;
+
+      while ($next_start < $season_end) {
+	$next_start_string = date("Y-m-d H:i:s", $next_start);
+	$next_end_string = date("Y-m-d H:i:s", $next_start + $runtime);
+
+	//just keeping for comparison later
+	$next_start_string_orig = $next_start_string;
+	$next_end_string_orig = $next_end_string;
+
+	//storing the orig and next hour values
+	$orig_start_hour = substr($start, 11, 2);
+	$orig_end_hour = substr($end, 11, 2);
+
+	$next_start_hour = substr($next_start_string, 11, 2);
+	$next_end_hour = substr($next_end_string, 11, 2);
+
+	/**
+	 * BEGINNING  OF OPENFLOWS MARK LIBKUMAN HACK DONE ON 12/9/2015
+	 * NOTICE: THIS IS A BIG HACK, WHEN DEALING WITH TIMES THAT ARE 
+	 * TIMEZONE SHIFT MANY TIMES BY BOTH DRUPAL AND PHP RESULTS IN TIMES
+	 * IN PORTLAND BETWEEN 6PM AND 6:59PM BEING IN CORRECTLY SHIFTED 
+	 * BECAUSE THE OFFSET IS BEING ADDED IN A WAY THAT MAKES IT THINK
+	 * ITS 2AM ON SPRING FORWARD DST CHANGE DAY WHICH DOESN'T EXIST
+	 * AND THEREFORE A UNWANTED CORRECTION HAPPENS
+	 */
+	//ARRAY OF "YYYY-MM-DD H" FOR THE INCORRECTLY SHIFTED HOURS 
+	// i.e. 02 becomes 01 because 02 doesn't exist
+	$spring_forward_dates =
+	  array('2016-03-13 01',
+		'2017-03-12 01',
+		'2018-03-11 01',
+		'2019-03-10 01',
+		'2020-03-08 01');
+
+	if (in_array(date("Y-m-d H", $next_start), $spring_forward_dates) &&
+	    $orig_start_hour != $next_start_hour) {
+	  $next_start_string = 
+	    substr($next_start_string, 0, 11) . $orig_start_hour .
+	    substr($next_start_string, 13);
+
+	  $next_end_string = 
+	    substr($next_end_string, 0, 11) . $orig_end_hour .
+	    substr($next_end_string, 13);
+	  $needs_shift = TRUE;
+	}
+	//$needs_shift SHOULD ONLY BE SET IN THE ABOVE IF
+	else if (isset($needs_shift)) {	  
+	  $next_start = $next_start + 60*60;
+	  $next_start_string = date("Y-m-d H:i:s", $next_start);
+	  $next_end_string = date("Y-m-d H:i:s", $next_start + $runtime);
+	  unset($needs_shift);
+	}
+
+	/**
+	dsm("---------------------------------------------");
+	dsm($start, 'my orig start');
+	dsm($orig_start_hour, 'orig start hour');
+	dsm($next_start_hour, 'my next hour');
+	
+	dsm($next_start_string_orig, 'my orig next start');
+	dsm($next_end_string_orig, 'my orig next end');
+
+	dsm($next_start_string, 'my next start');
+	dsm($next_end_string, 'my next end');
+	
+	if ($next_end_string_orig != $next_end_string) {
+	  dsm("i'v end shifted!!!!!!!!!!!!!!!!!!!!");
+	}
+	if ($next_start_string_orig != $next_start_string) {
+	  dsm("i'v start shifted!!!!!!!!!!!!!!!!!!!!");
+	}
+	*/
+	/*
+	 * END OF OPENFLOWS MARK LIBKUMAN HACK DONE ON 12/9/2015
+	 */
+
+	$slot++;
+	$new_airing = pcm_airing_clone($entity, LANGUAGE_NONE);
+	$new_airing->field_airing_date[LANGUAGE_NONE][0]['value'] = 
+	  $next_start_string;
+	
+	$new_airing->field_airing_date[LANGUAGE_NONE][0]['value2'] = 
+	  $next_end_string;
+	
+	//setting this so down the line we can link up subsequent airings in
+	//the same slots
+	$new_airing->slot = $slot;
+
+	$wrapper = entity_metadata_wrapper('airing', $new_airing);
+	$wrapper->save();
+	$new_airing->airing_id = $wrapper->getIdentifier();
+
+	$pcm_airing_proj_season[$slot] = 
+	  isset($pcm_airing_proj_season[$slot]) ?
+	  $pcm_airing_proj_season[$slot] : array();
+
+	$s_index = 
+	$pcm_airing_proj_season[$slot][] = 
+	  $new_airing;
+
+	$next_start = pcm_airing_get_next_air_date($next_start, $frequency);
+      }
+    }
+ 
+    //LOOK TO SEE IF WE NEED TO CREATE A AIRING CONFLICT
+    pcm_airing_create_conflicts($entity);
+
+    //if we aren't doing a batch schedule, then display conflict block if
+    //there are conflicts
+    if (arg(0) != 'batch' ) {
+      pcm_airing_display_conflict_block(); 
+    }
+  }
+}
+
+//called after the series request batch finishes scheduling a request.
+function pcm_airing_series_post_process() {
+  global $pcm_airing_proj_season;
+  foreach($pcm_airing_proj_season as $slot => $airings) {
+    $premiere_airing = NULL;
+    $premiere_show_id = NULL;
+    $subsequent_airings = array();
+    foreach($airings as $airing) {
+      //IF THIS IS A AN AIRING BEING ADDED BY A SERIES REQUEST, CHECK TO SEE IF
+      //IT THE PREMIERE AIRING THEN ADD ITS SHOW TO ALL THE SUBSEQUENT AIRINGS
+      $is_show_premiere_date = 
+	pcm_airing_get_single_field_value($airing, 
+					  'field_is_show_premiere_date', 
+					  'value');
+      $show_id =  
+	pcm_airing_get_single_field_value($airing, 
+					  'field_airing_show_ref', 
+					  'target_id');
+      //unsetting special variables on an airing that were set during batch
+      //scheduling as for now we want the simple save of the airing with its 
+      //show
+      unset($airing->first_of_season);
+      unset($slot);
+
+      if ($is_show_premiere_date) {
+	$premiere_airing = $airing;
+	$premiere_show_id = $show_id;
+
+	$start = 
+	  pcm_airing_get_single_field_value($airing, 
+					    'field_airing_date', 
+					    'value');
+	$show = node_load($show_id);
+
+	if ($start && $show) {
+	  $time = strtotime($start);
+	  $start = PCM_AIRING_TIMEZONE_SHIFT ? strtotime($start) + 
+	    date('Z',strtotime($start)) : strtotime($start);
+	  
+	  if (date('I', $time) != date('I', $start)) {
+	    if (date('I', $start)) {
+	      $start = $start - 60*60;
+	    }
+	    else if (date('I', $time)) {
+	      $start = $start + 60*60;
+	    }
+	  }
+
+	  $start = date('Y-m-d', $start);
+	  $show->field_premier_date[LANGUAGE_NONE][0]['value'] = $start;
+	  field_attach_update('node', $show);
+	  entity_get_controller('node')->resetCache(array($show->nid));
+	}
+
+      }
+      else {
+	$subsequent_airings[] = $airing;
+      }
+      
+    }
+    foreach($subsequent_airings as $sub) {
+      $premiere_airing->field_subsequent_airings[LANGUAGE_NONE] =
+        isset($premiere_airing->field_subsequent_airings) &&
+	$premiere_airing->field_subsequent_airings[LANGUAGE_NONE] ? 
+        $premiere_airing->field_subsequent_airings[LANGUAGE_NONE] : array();
+      
+      $premiere_airing->field_subsequent_airings[LANGUAGE_NONE][] = 
+        array('target_id'=>$sub->airing_id);
+      $sub->field_airing_show_ref[LANGUAGE_NONE][0]['target_id'] = 
+	$premiere_show_id;
+      entity_save('airing', $sub);
+	
+    }
+    entity_save('airing', $premiere_airing);
+  }
+  $pcm_airing_proj_season = array();
+}
+
+/**
+* Clone new airing from existing
+*/
+function pcm_airing_clone($airing) {
+  $new_airing = entity_create('airing', array());
+  $arr_fields_to_copy =
+    array('field_airing_date', 'field_airing_channel', 'field_series_request',
+          'field_airing_project_ref', 'field_airing_type', 'field_live_source',
+	  'field_is_show_premiere_date');
+  foreach ($arr_fields_to_copy as $field) {
+    if (isset($airing->$field)) {
+      $new_airing->$field = $airing->$field;
+    }
+  }
+  return $new_airing;
+}
+
+function pcm_airing_entity_presave($entity, $type) {
+  if ($type == 'airing') {
+
+    if (isset($entity->pcm_cm_show) && $entity->pcm_cm_show) {
+      $entity->field_airing_show_ref[LANGUAGE_NONE][0]['target_id'] =
+	$entity->pcm_cm_show;   
+    }
+
+    //////////////////////////////////////////////////////////////////////
+    //SET TITLE BASED ON PROJECT, SHOW, CHANNEL, AND START
+    $show_nid = isset($entity->field_airing_show_ref[LANGUAGE_NONE][0]) ?
+      $entity->field_airing_show_ref[LANGUAGE_NONE][0]['target_id'] : NULL;
+
+    $show = $show_nid ? node_load($show_nid, NULL, TRUE) : NULL;
+
+    $project_nid = isset($entity->field_airing_project_ref[LANGUAGE_NONE]) ?
+      $entity->field_airing_project_ref[LANGUAGE_NONE][0]['target_id'] : NULL;
+
+    //IF THE PROJECT IS NOT SET YET, GRAB FROM SHOW
+    if ($show && !$project_nid ) {
+      $project_nid = pcm_airing_get_single_field_value($show, 'og_group_ref', 
+						       'target_id');
+      //SET IT ON THE AIRING
+      $entity->field_airing_project_ref[LANGUAGE_NONE][0]['target_id'] =
+	$project_nid;
+    }
+
+    // PROJECT VARIABLES FOR TITLES
+    $project = $project_nid ? node_load($project_nid) : NULL;
+    
+    $project_type = ($project && 
+		     $project->field_cm_project_types[LANGUAGE_NONE]) ?
+      $project->field_cm_project_types[LANGUAGE_NONE][0]['tid'] : NULL;         
+        
+    // AIRING VARIABLES FOR TITLES
+    $channel_tid = isset($entity->field_airing_channel[LANGUAGE_NONE]) ?
+      $entity->field_airing_channel[LANGUAGE_NONE][0]['tid'] : NULL;
+
+    $channel = $channel_tid ? taxonomy_term_load($channel_tid) : NULL;
+    $channel = $channel ? str_replace("Channel ", "CH:", $channel->name) : "";
+
+    $start = isset($entity->field_airing_date[LANGUAGE_NONE][0]) ?
+      $entity->field_airing_date[LANGUAGE_NONE][0]['value'] : NULL;
+      
+    // TIME SHIFT FOR THE PREMIERE DATE    
+    if ($start) {
+      $premiere_object = 
+  new DateTime($start, 
+           new DateTimeZone('UTC'));
+      $premiere_object->setTimeZone(new DateTimeZone('America/Los_Angeles'));
+      $premiere_date = $premiere_object->format('y-m-d');
+    }
+    
+    // BUILD THE TITLES
+    $title = "";    
+    
+    if ($project_type == PCM_SHOW_INDIVIDUAL_PROJECT_TYPE_TID) {
+    // SHOW VARIABLES FOR TITLES
+      $tv_guide_title = isset($show->field_tv_guide_title[LANGUAGE_NONE]) ?
+          $show->field_tv_guide_title[LANGUAGE_NONE][0]['value'] :
+          NULL;
+      $title = $tv_guide_title ? $tv_guide_title : ""; 
+    }
+    else {
+      $title = $project ? $project->title : ""; 
+    }
+     
+    if ($channel) {
+      $title = $title ? $title .= ": " .$channel : $channel;
+    }
+    if ($premiere_date) {
+      $title = $title ? $title .= ": " .$premiere_date : $premiere_date;
+    }
+    if ($title) {
+      $entity->field_airing_title[LANGUAGE_NONE][0]['value'] = $title;
+    }
+    //////////////////////////////////////////////////////////////////////
+    //UPDATE ENDTIME IF THIS AIRING HAS A SHOW
+    $runtime = pcm_airing_default_runtime($project, $show);
+
+    if ($runtime) {
+      $start_string = isset($entity->field_airing_date[LANGUAGE_NONE][0]) ?
+        $entity->field_airing_date[LANGUAGE_NONE][0]['value']: NULL;
+
+      //FIXME TIMEZONE ISSUE, IF WE CHANGE STORAGE METHOD NEED TO CHANGE THIS
+      $start_object = new DateTime($start_string, new DateTimeZone('UTC'));
+      
+      $end_object = $start_object->add(new DateInterval('PT'.$runtime.'S'));
+      $end_string = $end_object->format('Y-m-d H:i:s');
+
+      $entity->field_airing_date[LANGUAGE_NONE][0]['value2'] = $end_string;
+    }
+
+    $live_source = (isset($entity->field_live_source[LANGUAGE_NONE]) &&
+		    isset($entity->field_live_source[LANGUAGE_NONE][0])) ?
+      $entity->field_live_source[LANGUAGE_NONE][0]['value']: NULL;
+
+    $show_id =  (isset($entity->field_airing_show_ref[LANGUAGE_NONE]) &&
+		 isset($entity->field_airing_show_ref[LANGUAGE_NONE][0])) ?
+      $entity->field_airing_show_ref[LANGUAGE_NONE][0]['target_id']: NULL;
+
+    
+    if ($live_source && !$show_id) {
+      $show = pcm_airing_create_live_show($entity);
+      $entity->field_airing_show_ref[LANGUAGE_NONE][0]['target_id']
+	= $show->nid;
+    }
+    else if (!$show_id) {
+      $entity->field_airing_show_ref[LANGUAGE_NONE][0]['target_id'] = 
+	pcm_airing_get_placeholder_show($entity);
+    }
+
+    //////////////////////////////////////////////////////////////////////////
+    //IF THE EDIT TYPE IS SET IN THE FORM AND ITS EQUAL TO 'all' WE WILL FIND
+    //ALL FUTURE AIRINGS OF THE AIRING'S PREVIOUS SHOW AND SWAP THEM ALL TO 
+    //THE NEW SHOW pcm_cm_show_edit_type pcm_existing_show_id
+    if (isset($entity->pcm_cm_show_edit_type) &&
+    	$entity->pcm_cm_show_edit_type == 'all' &&
+	isset($entity->pcm_existing_show_id) &&
+	$entity->pcm_existing_show_id) {
+      
+      $show_airings = 
+	cm_airing_grid_get_future_show_airings($entity->pcm_existing_show_id, 
+					       $entity->airing_id);
+      if ($show_airings) {
+	foreach($show_airings as $other_airing_id) {
+	  if ($other_airing_id != $entity->airing_id) {
+	    $other_airing = entity_load('airing', array($other_airing_id));
+	    $other_airing = array_pop($other_airing);
+	    $other_airing->field_airing_show_ref[LANGUAGE_NONE][0]
+	      ['target_id'] = $show_nid;
+	    $other_airing->cm_use_auto_title = TRUE;
+	    $other_airing->cm_use_auto_endtime = TRUE;
+	    entity_save('airing', $other_airing);	
+	  }
+	}
+      }
+    }	
+  }
+}
+
+function pcm_airing_get_placeholder_show($airing) {
+  //get project off airing
+  $project_id = 
+    $airing->field_airing_project_ref[LANGUAGE_NONE][0]['target_id'];
+  $project = node_load($project_id);
+  $project_title = $project->title;
+
+  $start_string = isset($airing->field_airing_date[LANGUAGE_NONE][0]) ?
+    $airing->field_airing_date[LANGUAGE_NONE][0]['value']: NULL;
+
+  $end_string = isset($airing->field_airing_date[LANGUAGE_NONE][0]) ?
+    $airing->field_airing_date[LANGUAGE_NONE][0]['value2']: NULL;
+
+  if ($start_string) {
+    //FIXME TIMEZONE ISSUE, IF WE CHANGE STORAGE METHOD NEED TO CHANGE THIS
+    $start_object = new DateTime($start_string, new DateTimeZone('UTC'));
+    $end_object = new DateTime($end_string, new DateTimeZone('UTC'));
+    
+    $runtime = $end_object->format('U') - $start_object->format('U');
+  }
+
+  //look in session to see if we have already found a placeholder show for 
+  //this project and runtime   
+  $session_key = "PCM_PROJECT_PLACEHOLDER_SHOW_". $project_id . "-" . $runtime;
+  $show_id = isset($_SESSION[$session_key]) ? $_SESSION[$session_key] : NULL;
+  $show = $show_id ? node_load($show_id) : NULL;
+  if ($show && $show_id) {
+    return $show_id;
+  }
+    
+  //query the DB for a placeholder show for this project and runtime
+  $show_id = pcm_airing_get_existing_placeholder_show(
+          $project_id, 
+          $runtime);
+
+  if ($show_id) {
+    $_SESSION[$session_key] = $show_id;
+    return $show_id;
+  }
+  
+  // NO PLACEHOLDER FOR THIS PROJECT/RUNTIME COMBINATION
+  //get title from project
+  $tv_guide_title = $project_title . ": TBD";
+
+  //???
+  $short_desc = $tv_guide_title;
+
+  //get genres from project
+  $genres = array();
+  if (isset($project->field_pbcore_genres) &&
+      isset($project->field_pbcore_genres[LANGUAGE_NONE])) {
+    foreach($project->field_pbcore_genres[LANGUAGE_NONE] as $value) {
+      $genres[] = $value['tid'];
+    }
+  }
+
+  $title = $project_title . ": TBD";
+
+      
+  $show = new stdClass();
+  $show->nid = 0;
+  $show->status = 1;
+  $show->comment = 0;
+  $show->promote= 0;
+  $show->sticky= 0;
+  $show->type='';
+  $show->language=LANGUAGE_NONE;
+  $show->tnid=0;
+  $show->translate=0;
+  $show->uid = 1;
+  $show->type = 'cm_show';
+  $show->og_group_ref[LANGUAGE_NONE][0]['target_id'] = $project_id;
+ 
+  $show->title = $title;
+  $show->field_show_special_title[LANGUAGE_NONE][0]['value'] = $title;
+  $show->field_tv_guide_title[LANGUAGE_NONE][0]['value'] = $tv_guide_title;
+  $show->field_short_description[LANGUAGE_NONE][0]['value'] = $short_desc;
+  $show->field_show_is_special[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_runtime[LANGUAGE_NONE][0]['value'] = $runtime;
+  $show->field_produced_where[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_produced_city[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_pcm_facilities[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_can11[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_pcm_channels[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_objectionable_content[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_filler[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_duplication_release[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_technical_requirements[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_special_show_scheduling[LANGUAGE_NONE][0]['value'] = 
+    "Placeholder";
+  $show->field_expected_file_format[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_is_placeholder[LANGUAGE_NONE][0]['value'] = 1;
+  $index = 0;
+  foreach ($genres as $tid) {
+    $show->field_pbcore_genres[LANGUAGE_NONE][$index]['tid'] = $tid;
+    $index++;
+  }
+
+  node_save($show);
+
+  $_SESSION[$session_key] = $show->nid;
+
+  return $show->nid;
+}
+
+function pcm_airing_get_existing_placeholder_show(
+                                $project_id, $runtime) {
+  $sql = "
+    SELECT n.nid 
+    FROM node n
+    INNER JOIN og_membership og 
+      ON (og.etid = n.nid AND og.entity_type='node')
+    INNER JOIN field_data_field_runtime r on r.entity_id = n.nid
+    INNER JOIN field_data_field_is_placeholder p on p.entity_id=n.nid
+    WHERE og.gid = :project_id
+    AND r.field_runtime_value = :runtime
+    AND p.field_is_placeholder_value = 1";
+
+  $show_nid = db_query($sql, array(':project_id' => $project_id,
+				   ':runtime' => $runtime))->fetchField();           
+
+  return $show_nid;
+
+}
+
+function pcm_airing_default_runtime($project, $show) {
+  $runtime = $show && isset($show->field_runtime[LANGUAGE_NONE]) &&
+    isset($show->field_runtime[LANGUAGE_NONE][0]) ?
+    $show->field_runtime[LANGUAGE_NONE][0]['value'] : NULL;
+
+  return $runtime;
+}
+/*                                                           
+ * This is a util funtion that allows you to add x amount of units to 
+ * a date. I.e. i want to add 4 weeks or 3 days to a date.  
+ * 
+ * The important thing in this function is it takes into affect
+ * DST so that if i add 1 week to Monday at 4pm, i get the next week at
+ * 4pm regardless of if there was DST change within the week.
+ *                                      
+ * @param $time the time to which to ad
+ * @param $type will be either hour, day or week
+ * @param $multiplier the amount of hours, days, or week
+ */
+function pcm_airing_add_to_date($time, $type, $multiplier) {
+  if (!$multiplier) {
+    $multiplier = 1;
+  }
+  $orig_time = $time; 
+  $orig_time_shifted = PCM_AIRING_TIMEZONE_SHIFT ? 
+    $time + date('Z', $time) : $time;
+
+  if ($type == "week") {
+    $new_time_shifted = $orig_time_shifted + $multiplier*7*24*60*60;
+  }
+  else if ($type == "hour") {
+    $new_time_shifted = $orig_time_shifted + $multiplier*60*60;
+  }
+  else if ($type == "day") {
+    $new_time_shifted = $orig_time_shifted + $multiplier*24*60*60;
+  }
+  else if ($type == 'minute') {
+    $new_time_shifted = $orig_time_shifted + $multiplier*60;
+  }
+  else if ($type == 'second') {
+    $new_time_shifted = $orig_time_shifted + $multiplier;
+  }
+
+  $new_time = PCM_AIRING_TIMEZONE_SHIFT ? 
+    $new_time_shifted - date('Z', $new_time_shifted) : $new_time_shifted;
+
+  /*
+  dsm(date('m-d H:i Z', $orig_time), 'orig time');  
+  dsm(date('m-d H:i Z', $new_time), 'new time');  
+  dsm(date('m-d H:i Z', $orig_time_shifted), 'orig time shifted');
+  dsm(date('m-d H:i Z', $new_time_shifted), 'new time shifted');
+  */  
+
+  $adjust = 0;
+  if (date('I', $orig_time_shifted) == date('I', $new_time_shifted) &&
+      date('I', $orig_time) != date('I', $new_time)) {
+    $neg_pos = date('I', $new_time) ? -1 : 1;
+    if  (date('I', $orig_time) != date('I', $orig_time_shifted)) {
+      //do nothing
+    }
+    else if (date('I', $new_time) != date('I', $new_time_shifted)) {
+      $adjust = 60*60;
+    }
+    else {
+      //do nothing
+    }
+  }
+  else if (date('I', $orig_time_shifted) != date('I', $new_time_shifted)) {
+    $neg_pos = date('I', $new_time_shifted) ? -1 : 1;
+    if  (date('I', $orig_time) != date('I', $orig_time_shifted)) {
+      $adjust = 60*60;
+    }
+    else if (date('I', $new_time) != date('I', $new_time_shifted)) {
+      //do nothing
+    }
+    else {
+      $adjust = 60*60;
+    }
+    
+  }
+  if ($adjust) {
+    //dsm("adjust: $adjust neg_pos: $neg_pos");
+    $new_time += ($adjust * $neg_pos);
+    $new_time_shifted = PCM_AIRING_TIMEZONE_SHIFT ? 
+      $new_time + date('Z', $new_time) : $new_time;
+ 
+  }
+  
+  //dsm(date('m-d H:i Z', $new_time), 'new time adjusted');  
+  //dsm(date('m-d H:i Z', $new_time_shifted), 'new time shifted adjusted');
+  //dsm('------------------------------------------------------');
+  return $new_time;
+}
+
+
+function pcm_airing_entity_delete($entity, $type){
+  if ($type == 'airing') {
+    $results = pcm_airing_get_existing_conflict_entities($entity);
+
+    while ($existing_conflict = $results->fetchObject()) {
+      entity_delete('airingconflict', $existing_conflict->airing_conflict_id);
+    }
+  }
+}
+
+function pcm_airing_entity_update($entity, $type){
+  if ($type == 'airing') {
+    global $user;
+    $results = pcm_airing_get_conflicting_airings($entity);
+    $overlap_airings = array();
+
+    foreach ($results as $overlap_airing) {
+      $overlap_airings[] = $overlap_airing->entity_id;
+    }
+
+    $results = pcm_airing_get_existing_conflict_entities($entity);
+    $existing_conflicts = array();
+    $conflict_entity_ids = array();
+    while ($existing_conflict = $results->fetchObject()) {
+      if ($entity->airing_id != $existing_conflict->original){
+	$existing_conflicts[] = $existing_conflict->original;
+	$conflict_entity_ids[$existing_conflict->original] = 
+	  $existing_conflict->airing_conflict_id;
+      }
+      if ($entity->airing_id != $existing_conflict->overlap){
+	$existing_conflicts[] = $existing_conflict->overlap;
+	$conflict_entity_ids[$existing_conflict->overlap] = 
+	  $existing_conflict->airing_conflict_id;
+      }
+
+    }
+    $intersecting_airings = array_intersect($overlap_airings, 
+					    $existing_conflicts);
+
+    $new_conflicts = array_diff($overlap_airings, $intersecting_airings);
+    foreach($new_conflicts as $airing_id) {
+      $conflict = new stdClass();
+      $conflict->uid = $user->uid;
+      $conflict->created = strtotime('now');
+      $conflict->changed = strtotime('now');
+      $conflict->type = 'airingconflict';
+      $conflict->field_conflict_airing_original[LANGUAGE_NONE][0]['target_id']
+	= $airing_id;
+      $conflict->field_conflict_airing_overlap[LANGUAGE_NONE][0]['target_id']
+	= $entity->airing_id;
+      entity_save('airingconflict',$conflict);      
+    }
+
+    $resolved_conflicts = 
+      array_diff($existing_conflicts, $intersecting_airings);
+
+    foreach($resolved_conflicts as $airing_id) { 
+      entity_delete('airingconflict', $conflict_entity_ids[$airing_id]);
+    }
+    pcm_airing_display_conflict_block(); 
+  }
+}
+
+function pcm_airing_display_conflict_block() {
+  global $pcm_airing_conflict_surpress_block;
+
+  if (isset($pcm_airing_conflict_surpress_block) && 
+      $pcm_airing_conflict_surpress_block) {
+    return;
+  }
+
+  if (!user_access('view airing grid')) {
+    return;
+  }
+
+  $view = 
+    views_get_view('airing_conflict_block');
+  if ($view) {
+    //build and execute the view using the content type of the bucket
+    $output = $view->execute_display('block_1');   
+    $result_count = count($view->result);
+    if ($result_count > 0) {
+      drupal_set_message("<h2>".$output['subject']."</h2>".
+			 t("There are airings that overlap! ".
+			   "Please fix them using the links below.").
+			 $output['content'], 'error');
+    }  
+  }
+}
+function pcm_airing_get_existing_conflict_entities(&$airing) {
+  $sql = 
+    "SELECT ac.airing_conflict_id, 
+     field_conflict_airing_overlap_target_id as overlap, 
+     field_conflict_airing_original_target_id as original 
+     FROM cm_airing_conflict ac 
+     INNER JOIN field_data_field_conflict_airing_original o 
+       ON o.entity_id=ac.airing_conflict_id 
+     INNER JOIN field_data_field_conflict_airing_overlap ov 
+       ON ov.entity_id=ac.airing_conflict_id
+     WHERE field_conflict_airing_overlap_target_id=:airing_id 
+     OR field_conflict_airing_original_target_id=:airing_id";
+  return db_query($sql, array(':airing_id' => $airing->airing_id));  
+}
+
+function pcm_airing_get_conflicting_airings(&$airing) {
+  global $pcm_script_airing_conflict_override;
+
+  if (isset($pcm_script_airing_conflict_override)) {
+    //override, probably from data cleanup script
+    return array();
+  }
+
+  $start = $airing->field_airing_date[LANGUAGE_NONE][0]['value'];
+  $end = $airing->field_airing_date[LANGUAGE_NONE][0]['value2'];
+  $channel = $airing->field_airing_channel[LANGUAGE_NONE][0]['tid'];
+  $source = (isset($airing->field_live_source) &&
+	     isset($airing->field_live_source[LANGUAGE_NONE]) &&
+	     isset($airing->field_live_source[LANGUAGE_NONE][0])) ?
+    $airing->field_live_source[LANGUAGE_NONE][0]['value']: NULL;
+
+  $now = date('Y-m-d');
+  $sql = 
+    "SELECT d.entity_id 
+     FROM {field_data_field_airing_date} d
+     INNER JOIN {field_data_field_airing_channel} c
+     ON d.entity_id = c.entity_id
+     WHERE c.entity_type = 'airing' 
+     AND d.entity_type='airing'
+     AND c.field_airing_channel_tid = :channel
+     AND :start < d.field_airing_date_value2   
+     AND :end > d.field_airing_date_value   
+     AND :now < d.field_airing_date_value   
+     AND :airing_id != d.entity_id
+    "; 
+  $args = array(
+		':channel' => $channel,
+		':start' => $start,
+		':end' => $end,
+		':now' => $now,
+		':airing_id' => $airing->airing_id,
+		);
+  $ret = array();
+  $results = db_query($sql, $args);
+  $has_results = FALSE;
+  while ($result = $results->fetchObject()) {
+    $has_results = TRUE;
+    $ret[] = $result;
+  }
+
+  if ($has_results) {
+    //pcm_data_massage_log_query($sql, $args);
+  }
+
+  if ($source) {
+    $sql = 
+      "SELECT d.entity_id 
+       FROM {field_data_field_airing_date} d
+       INNER JOIN {field_data_field_live_source} s
+       ON d.entity_id = s.entity_id
+       WHERE s.entity_type = 'airing' 
+       AND d.entity_type='airing'
+       AND s.field_live_source_value = :source
+       AND :start < d.field_airing_date_value2   
+       AND :end > d.field_airing_date_value   
+       AND :now < d.field_airing_date_value   
+       AND :airing_id != d.entity_id
+       AND field_live_source_value != 22
+    "; 
+    $args = array(
+		  ':source' => $source,
+		  ':start' => $start,
+		  ':end' => $end,
+		  ':now' => $now,
+		  ':airing_id' => $airing->airing_id,
+		  );
+
+    $results = db_query($sql, $args);
+    $has_results = FALSE;
+    while ($result = $results->fetchObject()) {
+      $has_results = TRUE;
+      $ret[] = $result;
+    }
+
+    if ($has_results) {
+      //pcm_data_massage_log_query($sql, $args);
+    }
+    
+  }
+
+  return $ret;
+}
+
+function pcm_airing_create_conflicts(&$airing){
+  global $user;
+
+  $results = pcm_airing_get_conflicting_airings($airing);
+
+  $conflicts = array();
+
+  foreach ($results as $result) {
+    $conflict = new stdClass();
+    $conflict->uid = $user->uid;
+    $conflict->created = strtotime('now');
+    $conflict->changed = strtotime('now');
+    $conflict->type = 'airingconflict';
+    $conflict->field_conflict_airing_original[LANGUAGE_NONE][0]['target_id'] =
+      $result->entity_id;
+    $conflict->field_conflict_airing_overlap[LANGUAGE_NONE][0]['target_id'] =
+      $airing->airing_id;
+    entity_save('airingconflict',$conflict);
+    $conflicts[] = $conflict;
+  }
+  return $conflicts;
+}
+
+function computed_field_field_airing_grid_link_compute(&$entity_field, 
+						       $entity_type, $entity, 
+						       $field, $instance, 
+						       $langcode, $items) {
+  $link = l(t("See on Airing Grid"), "admin/manage/scheduling",
+	    array('query'=>array('airing_id'=>$entity->airing_id)));
+  $entity_field[0]['value'] = $link;
+}
+
+
+function pcm_airing_create_live_show($airing) {
+  global $user;
+  $uid = $user->uid;
+
+  //get project off airing
+  $project_id = 
+    $airing->field_airing_project_ref[LANGUAGE_NONE][0]['target_id'];
+  $project = node_load($project_id);
+  
+  // PROJECT VARIABLES
+  $project_title = $project->title;
+  
+  $episode_number = pcm_show_get_next_episode_number($project_id);
+  
+  $project_short_desc = $project ?
+    pcm_airing_get_single_field_value($project, 'field_short_description') :
+    "";
+  
+  //get genres from project
+  $genres = array();
+  if (isset($project->field_pbcore_genres) &&
+      isset($project->field_pbcore_genres[LANGUAGE_NONE])) {
+    foreach($project->field_pbcore_genres[LANGUAGE_NONE] as $value) {
+      $genres[] = $value['tid'];
+    }
+  }
+
+  // get live from project
+  $is_live = $project ?
+    pcm_airing_get_single_field_value($project, 'field_live') :
+    NULL;  
+
+    
+  // SERIES REQUEST VARIABLES
+  $series_request_id = $airing->field_series_request[LANGUAGE_NONE][0]
+    ['target_id'];
+  $series_request = node_load($series_request_id);
+  
+  // get runtime from series
+  $runtime_tid = 
+      $series_request->field_runtime_default[LANGUAGE_NONE][0]['tid'];
+  $runtime = pcm_airing_get_runtime_seconds_for_tid($runtime_tid);
+
+  // get live from series request - if not available use value from project
+  $is_live = $series_request ?
+    pcm_airing_get_single_field_value($series_request, 'field_live') :
+    $is_live;  
+
+    
+  // AIRING VARIABLES
+  $airing_start_date = $airing->field_airing_date[LANGUAGE_NONE][0]
+    ['value'];
+   
+    if (isset($airing_start_date) && $airing_start_date) {
+      $premiere_object = 
+	new DateTime($airing_start_date, 
+		       new DateTimeZone('UTC'));
+      $premiere_object->setTimeZone(new DateTimeZone('America/Los_Angeles'));
+      $premiere_date = $premiere_object->format('m-d-y');
+    }
+      
+  // SET THE TV GUIDE (CG) TITLE
+  // Series Live - <project: premiere>; Series Rec - <project>
+  $tv_guide_title = $is_live ?
+    $project_title . ": " . $premiere_date :
+    $project_title;
+
+  $short_desc = $project_short_desc ? $project_short_desc : $tv_guide_title;
+  // 
+  $title = $project_title ." - " . $premiere_date;
+      
+  $show = new stdClass();
+  //FIXME ACTUALLY CREATE LIVE SHOW
+  $show = new stdClass();
+  $show->nid = 0;
+  $show->status = 1;
+  $show->comment = 0;
+  $show->promote= 0;
+  $show->sticky= 0;
+  $show->type='';
+  $show->language=LANGUAGE_NONE;
+  $show->tnid=0;
+  $show->translate=0;
+  $show->uid = $uid;
+  $show->type = 'cm_show';
+  $show->og_group_ref[LANGUAGE_NONE][0]['target_id'] = $project_id;
+ 
+  $show->field_episode_number[LANGUAGE_NONE][0]['value'] = $episode_number;
+  $show->title = $title;
+  $show->field_tv_guide_title[LANGUAGE_NONE][0]['value'] = $tv_guide_title;
+  $show->field_short_description[LANGUAGE_NONE][0]['value'] = $short_desc;
+  $show->field_show_is_special[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_runtime[LANGUAGE_NONE][0]['value'] = $runtime;
+  $show->field_produced_where[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_produced_city[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_pcm_facilities[LANGUAGE_NONE][0]['value'] = 1;
+  $show->field_can11[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_pcm_channels[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_objectionable_content[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_filler[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_duplication_release[LANGUAGE_NONE][0]['value'] = 0;
+  $show->field_technical_requirements[LANGUAGE_NONE][0]['value'] = 1;
+  $index = 0;
+  foreach ($genres as $tid) {
+    $show->field_pbcore_genres[LANGUAGE_NONE][$index]['tid'] = $tid;
+    $index++;
+  }
+
+  node_save($show);
+  return $show;
+}
+
+function pcm_airing_get_runtime_seconds_for_tid($tid) {
+  if (!isset($tid) || !$tid) {
+    return NULL;
+  }
+  $term = taxonomy_term_load($tid);
+  if (!$term) {
+    return NULL;
+  }
+
+  $seconds = (isset($term->field_runtime_seconds[LANGUAGE_NONE]) &&
+	      isset($term->field_runtime_seconds[LANGUAGE_NONE][0])) ?
+    $term->field_runtime_seconds[LANGUAGE_NONE][0]['value']: NULL;
+  
+  return $seconds;
+}
+
+/**
+ * @param $row - a row field for a view result from the view 
+ * airings_missing_show_content
+ * @return $field 
+ */
+function pcm_airing_airings_missing_show_content_link_field($row) {
+  $show = isset($row->nid) ? node_load($row->nid) : NULL;
+
+  if ($show) { 
+    $project_id = pcm_airing_get_single_field_value($show, 'og_group_ref', 
+						    'target_id');
+
+    if ($row->airing_id) {
+      $airings = entity_load('airing', array($row->airing_id));
+      $airing = array_pop($airings);
+      $airing_id = $row->airing_id;
+    }
+
+    $wrapper = entity_metadata_wrapper('airing', $airing);
+    $is_premiere = $wrapper->field_is_show_premiere_date->value();
+    $live_source = $wrapper->field_live_source->label();
+    
+    $is_placeholder = isset($show->field_is_placeholder) &&
+      isset($show->field_is_placeholder[LANGUAGE_NONE]) &&
+      isset($show->field_is_placeholder[LANGUAGE_NONE][0]) ?
+      $show->field_is_placeholder[LANGUAGE_NONE][0]['value'] : "";
+    
+    if ($is_placeholder) {
+      $project_id = 
+	pcm_airing_get_single_field_value($airing, 
+					  'field_airing_project_ref',
+					  'target_id');
+
+      $field =  
+	'<img style="width:25px;vertical-align:middle" 
+          src="/sites/default/files/15107_wpm_lowres.png" 
+          alt="Missing Show" title="Missing Show"/>'.
+	l("Submit Show", 'node/add/cm-show' ,
+	  array('query'=>array(
+			       'og_group_ref'=>$project_id,
+			       'airing_id'=>$row->airing_id,
+			       )
+		));
+    }
+    
+    if (!isset($field)) {
+      $filename = isset($show->field_expected_filename) &&
+	isset($show->field_expected_filename[LANGUAGE_NONE]) &&
+	isset($show->field_expected_filename[LANGUAGE_NONE][0]) ?
+	$show->field_expected_filename[LANGUAGE_NONE][0]['value'] : "";
+      
+      if (!$filename) {
+	$field = 
+	  '<img style="width:25px;vertical-align:middle" 
+           src="/sites/default/files/15107_wpm_lowres.png" 
+           alt="Missing Show" title="Missing Show"/>'.
+	  l("Upload File", 'node/'.$row->nid.'/upload');
+      }
+    }
+  }
+  $field = isset($field) ? $field : 'N/A'; 
+  return $field;
+}
+
+
+/**
+ * @param $airing_id 
+ *
+ * @return $group_airings if the airing is a premiere and has subsequent 
+ * airings then it will return them, if the airing is a subsequent airing it
+ * will return its premiere as well as its fellow subsquent airings
+ *
+ */
+function cm_airing_grid_get_group_airings($airing_id) {
+  $group_airings = array();
+
+  $view = views_get_view(PCM_AIRING_SHOW_AIRING_GROUP);
+  if (!$view) {
+    drupal_set_message("Error Code 51938: Missing view:".
+		       PCM_AIRING_SHOW_AIRING_GROUP, 'error');
+    return;
+  }
+  
+  //set show nid as argument
+  $view->set_arguments(array($airing_id));
+  $view->execute('subsequent');
+  $results = $view->result;
+
+  while ($result = array_shift($results)) {
+    $group_airings[] = $result->airing_id;
+  }
+
+  if (!$group_airings) {
+    $view = views_get_view(PCM_AIRING_SHOW_AIRING_GROUP);
+    $view->set_arguments(array($airing_id));
+    $view->execute('group_parent');
+
+    $results = $view->result;
+    
+    $result = array_shift($results);
+    if ($result) {
+      $airings = entity_load('airing', array($result->airing_id));
+      $airing = array_pop($airings);
+    
+      $sub_airings = 
+	isset($airing->field_subsequent_airings) &&
+	isset($airing->field_subsequent_airings[LANGUAGE_NONE]) &&
+	$airing->field_subsequent_airings[LANGUAGE_NONE] ?
+	$airing->field_subsequent_airings[LANGUAGE_NONE] : array();
+      
+      foreach($sub_airings as $sub_airing) {
+	//$group_airings[] = $result->airing_id;
+	if ($sub_airing['target_id'] != $airing_id) {
+	  $group_airings[] = $sub_airing['target_id'];
+	}
+	else {
+	  $group_airings[] = $airing->airing_id;
+	}
+      }
+    }
+  }
+  return $group_airings;
+}
+/**
+ * Implements hook_menu().
+ */
+function pcm_airing_menu() {
+  $items = array();
+
+  $items['admin/airing-conflict-ignore'] = 
+    array(
+	  'page callback' => 'drupal_get_form',
+	  'page arguments' => array('pcm_airing_conflict_delete_form'),
+	  'access arguments' => array('administer cm_airing'),
+	  'type' => MENU_CALLBACK,
+	  );
+  return $items;
+}
+
+function pcm_airing_conflict_delete_form($form, &$form_state) {
+  $id = arg(2);
+
+  if (!intval($id)) {
+    drupal_goto("");
+    //return;
+  }
+
+  $form = array();
+
+  $form['pcm_airing_conflict_delete_form_header'] = 
+    array('#markup'=> "<h1>".
+	  t("Are you sure you want to delete this conflict?").
+	  "</h1>");
+  $form['airing_conflict_id'] = array('#type' => 'hidden', '#value' => $id);
+  $form['submit_button'] = array(
+				 '#type' => 'submit',
+				 '#value' => t('Delete'),
+				 );
+  $form['pcm_airing_conflict_delete_form_footer'] =
+    array('#markup'=>"<br/>".l(t("Cancel"), "admin/programming"));
+
+  return $form;
+}
+
+
+function pcm_airing_conflict_delete_form_submit($form, &$form_state) {
+  $id = $form['airing_conflict_id']['#value'];
+
+  if (!intval($id)) {
+    drupal_goto("");
+    return;
+  }
+
+  entity_delete('airingconflict', $id);
+  drupal_goto("");
+}
