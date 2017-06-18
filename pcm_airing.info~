@@ -1,5 +1,0 @@
-name = pcm_airing
-description = Module providing custom airing support for PCM, includes form_alter, presave, and view hooks.
-core = 7.x
-package = PCM
-version = 7.x-1.0
